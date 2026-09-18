@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Revin-MD Pairing</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #164e63, #07111f 65%); color: #e5f9ff; }
+    main { width: min(92vw, 430px); padding: 30px; border: 1px solid #256477; border-radius: 24px; background: #0b1d2ad9; box-shadow: 0 24px 80px #0008; text-align: center; }
+    h1 { margin: 0 0 6px; font-size: 2rem; } p { color: #a8c9d2; line-height: 1.5; }
+    input, button { width: 100%; box-sizing: border-box; border-radius: 12px; padding: 14px; font-size: 1rem; }
+    input { margin: 14px 0 10px; border: 1px solid #356b7c; background: #071722; color: white; }
+    button { border: 0; background: #16a6b6; color: #031116; font-weight: 800; cursor: pointer; } button:disabled { opacity: .5; cursor: wait; }
+    #result { display: none; margin-top: 24px; padding: 20px; border-radius: 16px; background: #071722; }
+    #code { font: 800 2rem ui-monospace, monospace; letter-spacing: .2em; color: #70f5ff; word-break: break-word; }
+    #qr { max-width: 240px; width: 100%; margin: 8px auto; background: white; padding: 10px; border-radius: 10px; }
+    .small { font-size: .85rem; } .error { color: #ff9b9b; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Revin-MD</h1>
+    <p>Connect your WhatsApp account using a pairing code or QR code.</p>
+    <form id="pair-form">
+      <input id="phone" inputmode="numeric" autocomplete="tel" placeholder="2547XXXXXXXX" required>
+      <button id="submit" type="submit">Generate pairing</button>
+    </form>
+    <div id="result">
+      <div id="status"></div>
+      <div id="code"></div>
+      <img id="qr" alt="WhatsApp QR code" hidden>
+      <p class="small">Open WhatsApp → Linked devices → Link a device. Never share your code.</p>
+    </div>
+  </main>
+  <script>
+    // Replace this URL with the public HTTPS URL of the persistent Node backend.
+    const API_BASE = window.REVIN_API_URL || 'https://YOUR-BACKEND.example.com';
+    const form = document.querySelector('#pair-form');
+    const button = document.querySelector('#submit');
+    const result = document.querySelector('#result');
+    const status = document.querySelector('#status');
+    const code = document.querySelector('#code');
+    const qr = document.querySelector('#qr');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const phone = document.querySelector('#phone').value.replace(/[^0-9]/g, '');
+      if (phone.length < 7) return;
+      button.disabled = true;
+      result.style.display = 'block';
+      status.className = '';
+      status.textContent = 'Requesting pairing…';
+      code.textContent = '';
+      qr.hidden = true;
+      try {
+        const response = await fetch(`${API_BASE}/api/pair`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ phone })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Pairing request failed');
+        status.textContent = data.message || 'Use this code in WhatsApp:';
+        if (data.code) code.textContent = data.code;
+        if (data.qr) { qr.src = data.qr.startsWith('data:') ? data.qr : `data:image/png;base64,${data.qr}`; qr.hidden = false; }
+      } catch (error) {
+        status.className = 'error';
+        status.textContent = error.message;
+      } finally { button.disabled = false; }
+    });
+  </script>
+</body>
+</html>
