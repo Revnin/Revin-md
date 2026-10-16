@@ -4,6 +4,7 @@ const {
   DisconnectReason,
   WAMessageStubType,
   downloadMediaMessage,
+  downloadContentFromMessage,
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
@@ -26,6 +27,7 @@ loadEnv();
 
 const BOT_NAME = process.env.BOT_NAME || 'Revin-MD';
 const SONG_TIMEOUT_MS = Number.parseInt(process.env.SONG_TIMEOUT_MS, 10) || 45000;
+const SONG_COOKIES_FILE = process.env.SONG_COOKIES_FILE || '';
 const PREFIX = process.env.PREFIX || '.';
 const OWNER_NAME = process.env.OWNER_NAME || 'Revin';
 const OWNER_NUMBER = process.env.OWNER_NUMBER || '';
@@ -33,6 +35,7 @@ const ANTIDELETE_ENABLED = process.env.ANTIDELETE !== 'false';
 const STARTUP_NOTIFY = process.env.STARTUP_NOTIFY !== 'false';
 const MENU_IMAGE_URL = process.env.MENU_IMAGE_URL || 'https://imgur.com/a/KcGHbfW';
 const ANTIDELETE_DESTINATION = process.env.ANTIDELETE_DESTINATION || 'owner';
+let botMode = process.env.BOT_MODE?.toLowerCase() === 'public' ? 'public' : 'private';
 let resolvedMenuImageUrl;
 let retryCount = 0;
 let latestSocket;
@@ -106,6 +109,50 @@ function mediaType(message) {
   return null;
 }
 
+function unwrapMessage(message) {
+  let current = message;
+  const wrappers = [
+    'ephemeralMessage',
+    'viewOnceMessage',
+    'viewOnceMessageV2',
+    'viewOnceMessageV2Extension',
+    'documentWithCaptionMessage',
+  ];
+
+  while (current) {
+    const wrapper = wrappers.find((name) => current?.[name]?.message);
+    if (!wrapper) break;
+    current = current[wrapper].message;
+  }
+  return current;
+}
+
+function quotedViewOnceMessage(message) {
+  const context = message?.extendedTextMessage?.contextInfo;
+  const quoted = context?.quotedMessage;
+  if (!quoted) return null;
+
+  const isViewOnce = Boolean(
+    quoted.viewOnceMessage ||
+    quoted.viewOnceMessageV2 ||
+    quoted.viewOnceMessageV2Extension ||
+    Object.values(quoted).some((value) => value?.viewOnce === true),
+  );
+  if (!isViewOnce) return null;
+
+  const content = unwrapMessage(quoted);
+  const type = mediaType(content);
+  return type ? { content, type } : null;
+}
+
+async function downloadQuotedMedia(content, type) {
+  const media = content[`${type}Message`];
+  const stream = await downloadContentFromMessage(media, type);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 async function sendMessageSafe(sock, jid, content, options) {
   // A long yt-dlp request can overlap a WhatsApp reconnect. Never let a
   // rejected send become an unhandled promise that terminates the bot.
@@ -141,15 +188,21 @@ async function downloadSong(query, outPath) {
       noKeepVideo: true,
     };
 
-    // Use the same current YouTube extractor for URLs and title searches.
-    // The restricted Android client often fails specifically on ytsearch.
-    options.jsRuntimes = 'deno';
+    // Node is already required to run the bot. Explicitly enable it so yt-dlp
+    // can solve YouTube's JavaScript challenges even when Deno is not on PATH.
+    options.jsRuntimes = `node:${process.execPath}`;
     options.remoteComponents = 'ejs:github';
+    if (SONG_COOKIES_FILE) options.cookies = SONG_COOKIES_FILE;
 
     await ytDlp(source, options, { signal: controller.signal });
   } catch (error) {
     const details = error.stderr || error.shortMessage || error.message;
-    throw new Error(`yt-dlp failed: ${error.name === 'AbortError' ? `timed out after ${Math.round(SONG_TIMEOUT_MS / 1000)} seconds` : details}`);
+    const reason = error.name === 'AbortError'
+      ? `timed out after ${Math.round(SONG_TIMEOUT_MS / 1000)} seconds`
+      : /sign in to confirm|confirm you.re not a bot/i.test(details)
+        ? `${details}\nYouTube is requiring authentication for this server. Set SONG_COOKIES_FILE to a valid Netscape-format cookies file to authenticate.`
+        : details;
+    throw new Error(`yt-dlp failed: ${reason}`);
   } finally {
     clearTimeout(timeout);
   }
@@ -287,12 +340,36 @@ async function startBot() {
       if (!msg.message) continue;
 
       const from = msg.key.remoteJid;
+      // Keep the bot silent in groups. A command prefix must not cause a
+      // response that exposes the bot or draws attention to it there.
+      if (from?.endsWith('@g.us')) continue;
+
       const body =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
         '';
       const command = body.trim();
       const lowerCommand = command.toLowerCase();
+      const ownerChat = OWNER_NUMBER ? phoneToJid(OWNER_NUMBER) : ownJid(sock);
+      const isOwner = msg.key.fromMe || (ownerChat && sameJid(from, ownerChat));
+
+      // Private mode must be silent for every non-owner message, including
+      // commands such as `.mode` that would otherwise send an access reply.
+      if (!isOwner) continue;
+
+      if (lowerCommand === `${PREFIX}mode` || lowerCommand.startsWith(`${PREFIX}mode `)) {
+        if (!isOwner) {
+          await sendMessageSafe(sock, from, { text: '❌ Only the owner can change bot access.' }, { quoted: msg });
+          continue;
+        }
+
+        const requestedMode = command.split(/\s+/)[1]?.toLowerCase();
+        if (requestedMode === 'private' || requestedMode === 'public') botMode = requestedMode;
+        await sendMessageSafe(sock, from, {
+          text: `🔐 Bot access is currently *${botMode}*.\nUse ${PREFIX}mode private or ${PREFIX}mode public.`
+        }, { quoted: msg });
+        continue;
+      }
 
       // .help / .menu
       if (lowerCommand === `${PREFIX}help` || lowerCommand === `${PREFIX}menu`) {
@@ -306,6 +383,8 @@ async function startBot() {
             `> ${PREFIX}runtime — Show uptime\n` +
             `> ${PREFIX}owner — Show owner\n` +
             `> ${PREFIX}jid — Show chat ID\n` +
+            `> ${PREFIX}vv — Recover a view-once media reply\n` +
+            `> ${PREFIX}mode private/public — Set bot access\n` +
             `> ${PREFIX}time — Show server time\n` +
             `> ${PREFIX}groupinfo — Show group details\n` +
             `> ${PREFIX}admins — List group admins\n` +
@@ -325,6 +404,36 @@ async function startBot() {
         } : {
           text: `🖼️ ${MENU_IMAGE_URL}\n\n${menuText}`,
         }, { quoted: msg });
+        continue;
+      }
+
+      // .vv — recover a view-once media message that this command replies to
+      if (lowerCommand === `${PREFIX}vv`) {
+        const recovered = quotedViewOnceMessage(msg.message);
+        if (!recovered) {
+          await sendMessageSafe(sock, from, {
+            text: `❌ Reply to a view-once image, video, audio, or document with ${PREFIX}vv.`
+          }, { quoted: msg });
+          continue;
+        }
+
+        try {
+          const buffer = await downloadQuotedMedia(recovered.content, recovered.type);
+          const source = recovered.content[`${recovered.type}Message`];
+          const payload = { [recovered.type]: buffer };
+
+          if (source.mimetype) payload.mimetype = source.mimetype;
+          if (source.caption) payload.caption = source.caption;
+          if (source.fileName) payload.fileName = source.fileName;
+          if (recovered.type === 'audio') payload.ptt = source.ptt === true;
+
+          await sendMessageSafe(sock, from, payload, { quoted: msg });
+        } catch (error) {
+          console.error('[View-once recovery error]', error.stack || error.message);
+          await sendMessageSafe(sock, from, {
+            text: '❌ I could not download that view-once media. It may have expired or already been consumed.'
+          }, { quoted: msg });
+        }
         continue;
       }
 
